@@ -1,4 +1,5 @@
-// Garza Home MCP v3.9 - Fixed Beeper Intel column names (chat_id, content)
+// Garza Home MCP v4.0 - SSE transport for Claude.ai
+const AUTH_KEY = "garza-home-v3-8f2a1c9d4e6b7a3f5c8d2e1b9a4f6c3d";
 const BEEPER_BRIDGE_URL = "https://beeper-bridge.garzahive.com";
 const CC_MCP_URL = "https://computer-use-mcp.garzahive.com/direct";
 const CC_MCP_KEY = "computeruse2024garzahive";
@@ -131,7 +132,7 @@ async function executeBible(name, args) {
 }
 
 async function executeTool(name, args, env) {
-  if (name === "ping") return { pong: true, timestamp: new Date().toISOString(), version: "3.9" };
+  if (name === "ping") return { pong: true, timestamp: new Date().toISOString(), version: "4.0" };
   if (BEEPER_INTEL_TOOLS.includes(name)) return await executeBeeperIntel(name, args);
   if (GRAPHITI_TOOLS.includes(name)) return await executeGraphiti(name, args);
   if (BIBLE_TOOLS.includes(name)) return await executeBible(name, args);
@@ -141,31 +142,147 @@ async function executeTool(name, args, env) {
   return { error: `Unknown tool: ${name}` };
 }
 
-const corsHeaders = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type, Authorization" };
+async function handleJsonRpc(body, env) {
+  if (body.method === "initialize") {
+    return {
+      jsonrpc: "2.0",
+      id: body.id,
+      result: {
+        protocolVersion: "2024-11-05",
+        capabilities: { tools: {} },
+        serverInfo: { name: "Garza Home MCP", version: "4.0" }
+      }
+    };
+  }
+  if (body.method === "tools/list") {
+    return { jsonrpc: "2.0", id: body.id, result: { tools: TOOLS } };
+  }
+  if (body.method === "tools/call") {
+    const { name, arguments: args } = body.params;
+    const result = await executeTool(name, args || {}, env);
+    return {
+      jsonrpc: "2.0",
+      id: body.id,
+      result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] }
+    };
+  }
+  if (body.method === "notifications/initialized") {
+    return null; // No response needed for notifications
+  }
+  return { jsonrpc: "2.0", id: body.id, error: { code: -32601, message: "Method not found" } };
+}
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization"
+};
 
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+    
     const url = new URL(request.url);
-    if (url.pathname === "/health") return Response.json({ status: "ok", version: "3.9" }, { headers: corsHeaders });
-    if (request.method === "GET" && url.pathname === "/") {
-      return Response.json({ name: "Garza Home MCP", version: "3.9", tools: TOOLS.map(t => t.name) }, { headers: corsHeaders });
+    
+    // Health check
+    if (url.pathname === "/health") {
+      return Response.json({ status: "ok", version: "4.0" }, { headers: corsHeaders });
     }
+    
+    // Root info
+    if (request.method === "GET" && url.pathname === "/") {
+      return Response.json({ name: "Garza Home MCP", version: "4.0", tools: TOOLS.map(t => t.name) }, { headers: corsHeaders });
+    }
+    
+    // SSE endpoint for Claude.ai
+    if (url.pathname === "/sse") {
+      const key = url.searchParams.get("key");
+      if (key !== AUTH_KEY) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      
+      // Generate session ID
+      const sessionId = crypto.randomUUID();
+      const messagesUrl = `${url.origin}/messages/${sessionId}?key=${key}`;
+      
+      // Create SSE stream
+      const { readable, writable } = new TransformStream();
+      const writer = writable.getWriter();
+      const encoder = new TextEncoder();
+      
+      // Send endpoint event
+      const sendEvent = async (event, data) => {
+        await writer.write(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+      };
+      
+      // Send initial endpoint message
+      (async () => {
+        await sendEvent("endpoint", messagesUrl);
+        
+        // Keep connection alive with pings
+        const keepAlive = setInterval(async () => {
+          try {
+            await writer.write(encoder.encode(": ping\n\n"));
+          } catch {
+            clearInterval(keepAlive);
+          }
+        }, 30000);
+        
+        // Close after 5 minutes (Claude will reconnect)
+        setTimeout(() => {
+          clearInterval(keepAlive);
+          writer.close();
+        }, 300000);
+      })();
+      
+      return new Response(readable, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+          ...corsHeaders
+        }
+      });
+    }
+    
+    // Messages endpoint for SSE clients
+    if (url.pathname.startsWith("/messages/") && request.method === "POST") {
+      const key = url.searchParams.get("key");
+      if (key !== AUTH_KEY) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      
+      try {
+        const body = await request.json();
+        const response = await handleJsonRpc(body, env);
+        
+        if (response === null) {
+          return new Response(null, { status: 204, headers: corsHeaders });
+        }
+        
+        return Response.json(response, { headers: corsHeaders });
+      } catch (e) {
+        return Response.json(
+          { jsonrpc: "2.0", id: null, error: { code: -32700, message: e.message } },
+          { status: 400, headers: corsHeaders }
+        );
+      }
+    }
+    
+    // Legacy POST endpoint (JSON-RPC)
     if (request.method === "POST") {
       try {
         const body = await request.json();
-        if (body.method === "tools/list") {
-          return Response.json({ jsonrpc: "2.0", id: body.id, result: { tools: TOOLS } }, { headers: corsHeaders });
+        const response = await handleJsonRpc(body, env);
+        if (response === null) {
+          return new Response(null, { status: 204, headers: corsHeaders });
         }
-        if (body.method === "tools/call") {
-          const { name, arguments: args } = body.params;
-          const result = await executeTool(name, args || {}, env);
-          return Response.json({ jsonrpc: "2.0", id: body.id, result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] } }, { headers: corsHeaders });
-        }
+        return Response.json(response, { headers: corsHeaders });
       } catch (e) {
         return Response.json({ error: e.message }, { status: 400, headers: corsHeaders });
       }
     }
+    
     return Response.json({ error: "Not found" }, { status: 404, headers: corsHeaders });
   }
 };
