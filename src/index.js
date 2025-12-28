@@ -1,4 +1,4 @@
-// Garza Home MCP v4.0 - SSE transport for Claude.ai
+// Garza Home MCP v4.1 - SSE transport for Claude.ai
 const AUTH_KEY = "garza-home-v3-8f2a1c9d4e6b7a3f5c8d2e1b9a4f6c3d";
 const BEEPER_BRIDGE_URL = "https://beeper-bridge.garzahive.com";
 const CC_MCP_URL = "https://computer-use-mcp.garzahive.com/direct";
@@ -132,7 +132,7 @@ async function executeBible(name, args) {
 }
 
 async function executeTool(name, args, env) {
-  if (name === "ping") return { pong: true, timestamp: new Date().toISOString(), version: "4.0" };
+  if (name === "ping") return { pong: true, timestamp: new Date().toISOString(), version: "4.1" };
   if (BEEPER_INTEL_TOOLS.includes(name)) return await executeBeeperIntel(name, args);
   if (GRAPHITI_TOOLS.includes(name)) return await executeGraphiti(name, args);
   if (BIBLE_TOOLS.includes(name)) return await executeBible(name, args);
@@ -150,7 +150,7 @@ async function handleJsonRpc(body, env) {
       result: {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "Garza Home MCP", version: "4.0" }
+        serverInfo: { name: "Garza Home MCP", version: "4.1" }
       }
     };
   }
@@ -186,12 +186,12 @@ export default {
     
     // Health check
     if (url.pathname === "/health") {
-      return Response.json({ status: "ok", version: "4.0" }, { headers: corsHeaders });
+      return Response.json({ status: "ok", version: "4.1" }, { headers: corsHeaders });
     }
     
     // Root info
     if (request.method === "GET" && url.pathname === "/") {
-      return Response.json({ name: "Garza Home MCP", version: "4.0", tools: TOOLS.map(t => t.name) }, { headers: corsHeaders });
+      return Response.json({ name: "Garza Home MCP", version: "4.1", tools: TOOLS.map(t => t.name) }, { headers: corsHeaders });
     }
     
     // SSE endpoint for Claude.ai
@@ -210,14 +210,9 @@ export default {
       const writer = writable.getWriter();
       const encoder = new TextEncoder();
       
-      // Send endpoint event
-      const sendEvent = async (event, data) => {
-        await writer.write(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
-      };
-      
-      // Send initial endpoint message
+      // Send initial endpoint message - plain text, NOT JSON
       (async () => {
-        await sendEvent("endpoint", messagesUrl);
+        await writer.write(encoder.encode(`event: endpoint\ndata: ${messagesUrl}\n\n`));
         
         // Keep connection alive with pings
         const keepAlive = setInterval(async () => {
