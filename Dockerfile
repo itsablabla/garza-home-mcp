@@ -7,6 +7,6 @@ RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt
 COPY package*.json ./
 RUN npm install --omit=dev
 
-COPY server.mjs ./
-EXPOSE 3000
-CMD ["node", "server.mjs"]
+COPY server.js ./
+EXPOSE 8080
+CMD ["node", "server.js"]
