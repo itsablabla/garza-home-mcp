@@ -1,0 +1,36 @@
+{
+  "name": "garza-home-mcp",
+  "version": "1.0.0",
+  "description": "GARZA OS Home MCP - Personal/home automation: Beeper, Abode, UniFi, ProtonMail, Graphiti, Bible, Pushcut",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": [
+    "mcp",
+    "home-automation",
+    "beeper",
+    "abode",
+    "unifi",
+    "protonmail",
+    "graphiti",
+    "claude",
+    "anthropic",
+    "model-context-protocol"
+  ],
+  "author": "Jaden Garza <jadengarza@pm.me>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/itsablabla/garza-home-mcp.git"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "imap": "^0.8.19",
+    "mailparser": "^3.6.5",
+    "nodemailer": "^6.9.7"
+  }
+}
