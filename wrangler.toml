@@ -1,0 +1,8 @@
+name = "garza-home-mcp"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+account_id = "14adde85f76060c6edef6f3239d36e6a"
+
+[routes]
+pattern = "homemcp.garzahive.com/*"
+zone_name = "garzahive.com"
