@@ -1,4 +1,4 @@
-// Garza Home MCP v3.8 - Removed UniFi (use Garza Hive MCP instead)
+// Garza Home MCP v3.9 - Fixed Beeper Intel column names (chat_id, content)
 const BEEPER_BRIDGE_URL = "https://beeper-bridge.garzahive.com";
 const CC_MCP_URL = "https://computer-use-mcp.garzahive.com/direct";
 const CC_MCP_KEY = "computeruse2024garzahive";
@@ -10,10 +10,10 @@ const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 const TOOLS = [
   { name: "ping", description: "Health check", inputSchema: { type: "object", properties: {}, required: [] } },
   // Beeper Intelligence
-  { name: "beeper_search_history", description: "Search message history across all Beeper conversations", inputSchema: { type: "object", properties: { query: { type: "string", description: "Search text" }, room_id: { type: "string", description: "Optional: filter by room ID" }, limit: { type: "number", description: "Max results (default 20)" } }, required: ["query"] } },
-  { name: "beeper_recent_messages", description: "Get recent messages from a chat room", inputSchema: { type: "object", properties: { room_id: { type: "string", description: "Room/chat ID" }, limit: { type: "number", description: "Max results (default 50)" } }, required: ["room_id"] } },
+  { name: "beeper_search_history", description: "Search message history across all Beeper conversations", inputSchema: { type: "object", properties: { query: { type: "string", description: "Search text" }, chat_id: { type: "string", description: "Optional: filter by chat ID" }, limit: { type: "number", description: "Max results (default 20)" } }, required: ["query"] } },
+  { name: "beeper_recent_messages", description: "Get recent messages from a chat room", inputSchema: { type: "object", properties: { chat_id: { type: "string", description: "Chat ID" }, limit: { type: "number", description: "Max results (default 50)" } }, required: ["chat_id"] } },
   { name: "beeper_list_chats", description: "List all synced Beeper chats", inputSchema: { type: "object", properties: { limit: { type: "number" } }, required: [] } },
-  { name: "beeper_voice_memos", description: "List voice memos from Beeper", inputSchema: { type: "object", properties: { room_id: { type: "string" }, limit: { type: "number" } }, required: [] } },
+  { name: "beeper_voice_memos", description: "List voice memos from Beeper", inputSchema: { type: "object", properties: { chat_id: { type: "string" }, limit: { type: "number" } }, required: [] } },
   { name: "beeper_chat_stats", description: "Get message statistics for chats", inputSchema: { type: "object", properties: {}, required: [] } },
   // Graphiti
   { name: "graphiti_search", description: "Search knowledge graph", inputSchema: { type: "object", properties: { query: { type: "string" }, limit: { type: "number" } }, required: ["query"] } },
@@ -63,13 +63,13 @@ async function executeBeeperIntel(name, args) {
   switch (name) {
     case "beeper_search_history": {
       const limit = args.limit || 20;
-      let endpoint = `beeper_messages?body=ilike.*${encodeURIComponent(args.query)}*&order=timestamp.desc&limit=${limit}`;
-      if (args.room_id) endpoint += `&room_id=eq.${encodeURIComponent(args.room_id)}`;
-      return await supabaseQuery(endpoint.split("?")[0], Object.fromEntries(new URLSearchParams(endpoint.split("?")[1])));
+      let params = { content: `ilike.*${args.query}*`, order: "timestamp.desc", limit: String(limit) };
+      if (args.chat_id) params.chat_id = `eq.${args.chat_id}`;
+      return await supabaseQuery("beeper_messages", params);
     }
     case "beeper_recent_messages": {
       const limit = args.limit || 50;
-      return await supabaseQuery("beeper_messages", { room_id: `eq.${args.room_id}`, order: "timestamp.desc", limit: String(limit) });
+      return await supabaseQuery("beeper_messages", { chat_id: `eq.${args.chat_id}`, order: "timestamp.desc", limit: String(limit) });
     }
     case "beeper_list_chats": {
       const limit = args.limit || 50;
@@ -78,11 +78,11 @@ async function executeBeeperIntel(name, args) {
     case "beeper_voice_memos": {
       const limit = args.limit || 20;
       let params = { is_voice_memo: "eq.true", order: "timestamp.desc", limit: String(limit) };
-      if (args.room_id) params.room_id = `eq.${args.room_id}`;
+      if (args.chat_id) params.chat_id = `eq.${args.chat_id}`;
       return await supabaseQuery("beeper_messages", params);
     }
     case "beeper_chat_stats": {
-      return await supabaseQuery("beeper_chats", { order: "message_count.desc", limit: "20" });
+      return await supabaseQuery("beeper_chats", { order: "last_message_at.desc", limit: "20", select: "*" });
     }
   }
   return { error: "Unknown tool" };
@@ -131,7 +131,7 @@ async function executeBible(name, args) {
 }
 
 async function executeTool(name, args, env) {
-  if (name === "ping") return { pong: true, timestamp: new Date().toISOString(), version: "3.8" };
+  if (name === "ping") return { pong: true, timestamp: new Date().toISOString(), version: "3.9" };
   if (BEEPER_INTEL_TOOLS.includes(name)) return await executeBeeperIntel(name, args);
   if (GRAPHITI_TOOLS.includes(name)) return await executeGraphiti(name, args);
   if (BIBLE_TOOLS.includes(name)) return await executeBible(name, args);
@@ -147,9 +147,9 @@ export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
     const url = new URL(request.url);
-    if (url.pathname === "/health") return Response.json({ status: "ok", version: "3.8" }, { headers: corsHeaders });
+    if (url.pathname === "/health") return Response.json({ status: "ok", version: "3.9" }, { headers: corsHeaders });
     if (request.method === "GET" && url.pathname === "/") {
-      return Response.json({ name: "Garza Home MCP", version: "3.8", tools: TOOLS.map(t => t.name) }, { headers: corsHeaders });
+      return Response.json({ name: "Garza Home MCP", version: "3.9", tools: TOOLS.map(t => t.name) }, { headers: corsHeaders });
     }
     if (request.method === "POST") {
       try {
