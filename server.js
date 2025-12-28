@@ -1,15 +1,38 @@
 #!/usr/bin/env node
-// GARZA OS Home MCP Server v1.0.0
+// GARZA OS Home MCP Server v1.1.0 - SECURED
 // Personal/home automation: Beeper, Abode, UniFi, ProtonMail, Graphiti, Bible, Pushcut
 
 const http = require('http');
 const https = require('https');
+const crypto = require('crypto');
 
 const PORT = process.env.PORT || 8080;
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 
-// API Keys from environment
-const API_KEY = process.env.MCP_API_KEY || 'garza-home-v2-26f93afcebe2ea974cceeddbddeb4fdb';
+// ============ SECURITY CONFIG ============
+
+// API Keys - NO FALLBACKS (must be set in environment)
+const API_KEY = process.env.MCP_API_KEY;
+const ADMIN_KEY = process.env.MCP_ADMIN_KEY; // Optional: for sensitive operations
+
+if (!API_KEY) {
+  console.error('FATAL: MCP_API_KEY environment variable required');
+  process.exit(1);
+}
+
+// Rate limiting config
+const RATE_LIMIT_WINDOW = 60000; // 1 minute
+const RATE_LIMIT_MAX = 100; // requests per window
+const rateLimitMap = new Map();
+
+// Audit log (in-memory, rotates at 1000 entries)
+const auditLog = [];
+const MAX_AUDIT_LOG = 1000;
+
+// Session expiration (1 hour)
+const SESSION_EXPIRY = 3600000;
+
+// Service credentials
 const BEEPER_TOKEN = process.env.BEEPER_TOKEN;
 const ABODE_USER = process.env.ABODE_USER;
 const ABODE_PASS = process.env.ABODE_PASS;
@@ -23,10 +46,87 @@ const PROTON_USER = process.env.PROTON_USER;
 const PROTON_PASS = process.env.PROTON_PASS;
 const PROTON_BRIDGE = process.env.PROTON_BRIDGE || '127.0.0.1';
 
-// Session storage
-let abodeSession = null;
-let unifiCookies = [];
-let unifiToken = null;
+// Session storage with expiration
+let abodeSession = { token: null, expires: 0 };
+let unifiSession = { cookies: [], token: null, expires: 0 };
+
+// ============ SECURITY HELPERS ============
+
+function timingSafeEqual(a, b) {
+  if (!a || !b) return false;
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) {
+    // Compare against self to maintain constant time
+    crypto.timingSafeEqual(bufA, bufA);
+    return false;
+  }
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+function checkRateLimit(ip) {
+  const now = Date.now();
+  const record = rateLimitMap.get(ip) || { count: 0, resetAt: now + RATE_LIMIT_WINDOW };
+  
+  if (now > record.resetAt) {
+    record.count = 1;
+    record.resetAt = now + RATE_LIMIT_WINDOW;
+  } else {
+    record.count++;
+  }
+  
+  rateLimitMap.set(ip, record);
+  
+  // Cleanup old entries every 100 requests
+  if (rateLimitMap.size > 1000) {
+    for (const [key, val] of rateLimitMap) {
+      if (now > val.resetAt) rateLimitMap.delete(key);
+    }
+  }
+  
+  return record.count <= RATE_LIMIT_MAX;
+}
+
+function logAudit(action, details) {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    action,
+    ...details
+  };
+  auditLog.push(entry);
+  if (auditLog.length > MAX_AUDIT_LOG) auditLog.shift();
+  console.log(`[AUDIT] ${entry.timestamp} ${action}`, JSON.stringify(details));
+}
+
+function getClientIP(req) {
+  return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 
+         req.headers['x-real-ip'] || 
+         req.socket?.remoteAddress || 
+         'unknown';
+}
+
+function sanitizeInput(obj, maxDepth = 5, currentDepth = 0) {
+  if (currentDepth > maxDepth) return '[MAX_DEPTH]';
+  if (obj === null || obj === undefined) return obj;
+  if (typeof obj === 'string') {
+    // Limit string length and remove control characters
+    return obj.slice(0, 10000).replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '');
+  }
+  if (typeof obj === 'number' || typeof obj === 'boolean') return obj;
+  if (Array.isArray(obj)) {
+    return obj.slice(0, 100).map(item => sanitizeInput(item, maxDepth, currentDepth + 1));
+  }
+  if (typeof obj === 'object') {
+    const sanitized = {};
+    const keys = Object.keys(obj).slice(0, 50);
+    for (const key of keys) {
+      const safeKey = String(key).slice(0, 100);
+      sanitized[safeKey] = sanitizeInput(obj[key], maxDepth, currentDepth + 1);
+    }
+    return sanitized;
+  }
+  return String(obj).slice(0, 1000);
+}
 
 // ============ HELPERS ============
 
@@ -71,6 +171,7 @@ function jsonFetch(url, options = {}) {
 // ============ BEEPER ============
 
 async function beeperRequest(path, method = 'GET', body = null) {
+  if (!BEEPER_TOKEN) throw new Error('BEEPER_TOKEN not configured');
   const res = await jsonFetch(`https://api.beeper.com/v1${path}`, {
     method,
     headers: { 'Authorization': `Bearer ${BEEPER_TOKEN}` },
@@ -133,14 +234,23 @@ const beeperTools = {
 // ============ ABODE ============
 
 async function abodeAuth() {
-  if (abodeSession) return abodeSession;
+  const now = Date.now();
+  if (abodeSession.token && now < abodeSession.expires) return abodeSession.token;
+  
+  if (!ABODE_USER || !ABODE_PASS) throw new Error('Abode credentials not configured');
+  
   const res = await jsonFetch('https://my.goabode.com/api/auth2/login', {
     method: 'POST',
     body: { id: ABODE_USER, password: ABODE_PASS }
   });
   if (res.status !== 200) throw new Error('Abode auth failed');
-  abodeSession = res.data.token;
-  return abodeSession;
+  
+  abodeSession = {
+    token: res.data.token,
+    expires: now + SESSION_EXPIRY
+  };
+  logAudit('abode_auth', { success: true });
+  return abodeSession.token;
 }
 
 async function abodeRequest(path, method = 'GET', body = null) {
@@ -160,6 +270,7 @@ const abodeTools = {
     return { mode: panel.mode };
   },
   async abode_set_mode(args) {
+    logAudit('abode_set_mode', { mode: args.mode });
     return await abodeRequest('/v1/panel/mode', 'PUT', { mode: args.mode });
   },
   async abode_list_devices() {
@@ -169,9 +280,11 @@ const abodeTools = {
     return await abodeRequest(`/v1/devices/${args.device_id}`);
   },
   async abode_lock_device(args) {
+    logAudit('abode_lock_device', { device_id: args.device_id, lock: args.lock });
     return await abodeRequest(`/v1/devices/${args.device_id}/lock`, 'PUT', { lock: args.lock });
   },
   async abode_switch_device(args) {
+    logAudit('abode_switch_device', { device_id: args.device_id, on: args.on });
     return await abodeRequest(`/v1/devices/${args.device_id}/switch`, 'PUT', { on: args.on });
   },
   async abode_get_settings() {
@@ -181,6 +294,7 @@ const abodeTools = {
     return await abodeRequest('/v1/automations');
   },
   async abode_trigger_automation(args) {
+    logAudit('abode_trigger_automation', { automation_id: args.automation_id });
     return await abodeRequest(`/v1/automations/${args.automation_id}/trigger`, 'POST');
   }
 };
@@ -188,23 +302,30 @@ const abodeTools = {
 // ============ UNIFI PROTECT ============
 
 async function unifiAuth() {
-  if (unifiToken) return;
+  const now = Date.now();
+  if (unifiSession.token && now < unifiSession.expires) return;
+  
+  if (!UNIFI_USER || !UNIFI_PASS) throw new Error('UniFi credentials not configured');
+  
   const res = await jsonFetch(`https://${UNIFI_HOST}/api/auth/login`, {
     method: 'POST',
     body: { username: UNIFI_USER, password: UNIFI_PASS, rememberMe: true }
   });
   if (res.status !== 200) throw new Error('UniFi auth failed');
+  
   const setCookies = res.headers['set-cookie'] || [];
-  unifiCookies = setCookies.map(c => c.split(';')[0]);
-  const tokenCookie = unifiCookies.find(c => c.startsWith('TOKEN='));
-  if (tokenCookie) unifiToken = tokenCookie.split('=')[1];
+  unifiSession.cookies = setCookies.map(c => c.split(';')[0]);
+  const tokenCookie = unifiSession.cookies.find(c => c.startsWith('TOKEN='));
+  if (tokenCookie) unifiSession.token = tokenCookie.split('=')[1];
+  unifiSession.expires = now + SESSION_EXPIRY;
+  logAudit('unifi_auth', { success: true, host: UNIFI_HOST });
 }
 
 async function unifiRequest(path, method = 'GET', body = null) {
   await unifiAuth();
   const res = await jsonFetch(`https://${UNIFI_HOST}/proxy/protect/api${path}`, {
     method,
-    headers: { 'Cookie': unifiCookies.join('; ') },
+    headers: { 'Cookie': unifiSession.cookies.join('; ') },
     body
   });
   if (res.status >= 400) throw new Error(`UniFi error: ${res.status}`);
@@ -238,7 +359,7 @@ const unifiTools = {
         port: 443,
         path: `/proxy/protect/api/cameras/${args.camera_id}/snapshot?ts=${Date.now()}&force=true`,
         method: 'GET',
-        headers: { 'Cookie': unifiCookies.join('; ') },
+        headers: { 'Cookie': unifiSession.cookies.join('; ') },
         rejectUnauthorized: false,
         timeout: 8000
       }, (res) => {
@@ -272,6 +393,7 @@ const unifiTools = {
     return await unifiRequest('/lights');
   },
   async unifi_set_light(args) {
+    logAudit('unifi_set_light', { light_id: args.light_id, on: args.on });
     const body = { lightOnSettings: { isLedForceOn: args.on } };
     if (args.brightness !== undefined) body.lightDeviceSettings = { ledLevel: args.brightness };
     return await unifiRequest(`/lights/${args.light_id}`, 'PATCH', body);
@@ -280,6 +402,7 @@ const unifiTools = {
     return await unifiRequest('/chimes');
   },
   async unifi_play_chime(args) {
+    logAudit('unifi_play_chime', { chime_id: args.chime_id });
     return await unifiRequest(`/chimes/${args.chime_id}/play`, 'POST', { volume: args.volume || 50 });
   },
   async unifi_list_liveviews() {
@@ -297,19 +420,22 @@ const unifiTools = {
     return await unifiRequest(`/cameras/${args.camera_id}/ptz/goto/${args.slot}`, 'POST');
   },
   async unifi_set_camera_led(args) {
+    logAudit('unifi_set_camera_led', { camera_id: args.camera_id, enabled: args.enabled });
     return await unifiRequest(`/cameras/${args.camera_id}`, 'PATCH', { ledSettings: { isEnabled: args.enabled } });
   },
   async unifi_set_camera_mic(args) {
+    logAudit('unifi_set_camera_mic', { camera_id: args.camera_id, enabled: args.enabled });
     return await unifiRequest(`/cameras/${args.camera_id}`, 'PATCH', { isMicEnabled: args.enabled });
   },
   async unifi_set_lcd_message(args) {
+    logAudit('unifi_set_lcd_message', { camera_id: args.camera_id, message: args.message?.slice(0, 50) });
     return await unifiRequest(`/cameras/${args.camera_id}`, 'PATCH', {
       lcdMessage: { type: 'CUSTOM_MESSAGE', text: args.message, resetAt: args.duration ? Date.now() + args.duration : null }
     });
   },
   async unifi_health_check() {
     await unifiAuth();
-    return { status: 'healthy', host: UNIFI_HOST, authenticated: !!unifiToken };
+    return { status: 'healthy', host: UNIFI_HOST, authenticated: !!unifiSession.token };
   }
 };
 
@@ -317,6 +443,7 @@ const unifiTools = {
 
 const graphitiTools = {
   async graphiti_search(args) {
+    if (!GRAPHITI_URL) throw new Error('GRAPHITI_URL not configured');
     const res = await jsonFetch(`${GRAPHITI_URL}/search`, {
       method: 'POST',
       body: { query: args.query, limit: args.limit || 10 }
@@ -324,11 +451,14 @@ const graphitiTools = {
     return res.data;
   },
   async graphiti_get_facts(args) {
+    if (!GRAPHITI_URL) throw new Error('GRAPHITI_URL not configured');
     const url = args.entity ? `${GRAPHITI_URL}/facts?entity=${encodeURIComponent(args.entity)}` : `${GRAPHITI_URL}/facts`;
     const res = await jsonFetch(url);
     return res.data;
   },
   async graphiti_add_episode(args) {
+    if (!GRAPHITI_URL) throw new Error('GRAPHITI_URL not configured');
+    logAudit('graphiti_add_episode', { name: args.name });
     const res = await jsonFetch(`${GRAPHITI_URL}/episodes`, {
       method: 'POST',
       body: { name: args.name, content: args.content, source: args.source || 'claude' }
@@ -341,18 +471,21 @@ const graphitiTools = {
 
 const bibleTools = {
   async bible_votd() {
+    if (!BIBLE_API_KEY) throw new Error('BIBLE_API_KEY not configured');
     const res = await jsonFetch(`https://api.scripture.api.bible/v1/bibles/de4e12af7f28f599-01/verses-of-day`, {
       headers: { 'api-key': BIBLE_API_KEY }
     });
     return res.data;
   },
   async bible_passage(args) {
+    if (!BIBLE_API_KEY) throw new Error('BIBLE_API_KEY not configured');
     const res = await jsonFetch(`https://api.scripture.api.bible/v1/bibles/de4e12af7f28f599-01/passages/${encodeURIComponent(args.reference)}`, {
       headers: { 'api-key': BIBLE_API_KEY }
     });
     return res.data;
   },
   async bible_search(args) {
+    if (!BIBLE_API_KEY) throw new Error('BIBLE_API_KEY not configured');
     const res = await jsonFetch(`https://api.scripture.api.bible/v1/bibles/de4e12af7f28f599-01/search?query=${encodeURIComponent(args.query)}`, {
       headers: { 'api-key': BIBLE_API_KEY }
     });
@@ -367,6 +500,7 @@ const { simpleParser } = require('mailparser');
 const nodemailer = require('nodemailer');
 
 function getImapClient() {
+  if (!PROTON_USER || !PROTON_PASS) throw new Error('ProtonMail credentials not configured');
   return new Imap({
     user: PROTON_USER,
     password: PROTON_PASS,
@@ -451,6 +585,9 @@ const protonTools = {
   },
   
   async send_protonmail(args) {
+    if (!PROTON_USER || !PROTON_PASS) throw new Error('ProtonMail credentials not configured');
+    logAudit('send_protonmail', { to: args.to, subject: args.subject?.slice(0, 50) });
+    
     const transporter = nodemailer.createTransport({
       host: PROTON_BRIDGE,
       port: 1025,
@@ -490,6 +627,8 @@ const protonTools = {
 
 const pushTools = {
   async push_notify(args) {
+    if (!PUSHCUT_KEY) throw new Error('PUSHCUT_KEY not configured');
+    logAudit('push_notify', { title: args.title });
     const res = await jsonFetch(`https://api.pushcut.io/${PUSHCUT_KEY}/notifications/${encodeURIComponent(args.title)}`, {
       method: 'POST',
       body: {
@@ -499,6 +638,31 @@ const pushTools = {
       }
     });
     return res.data;
+  }
+};
+
+// ============ ADMIN TOOLS ============
+
+const adminTools = {
+  async get_audit_log(args) {
+    const limit = Math.min(args.limit || 50, 200);
+    return auditLog.slice(-limit);
+  },
+  async get_rate_limits() {
+    const now = Date.now();
+    const active = [];
+    for (const [ip, record] of rateLimitMap) {
+      if (now < record.resetAt) {
+        active.push({ ip: ip.slice(0, 20) + '...', count: record.count, resetIn: Math.round((record.resetAt - now) / 1000) });
+      }
+    }
+    return { active_limits: active.length, limits: active.slice(0, 20) };
+  },
+  async clear_sessions() {
+    abodeSession = { token: null, expires: 0 };
+    unifiSession = { cookies: [], token: null, expires: 0 };
+    logAudit('clear_sessions', { success: true });
+    return { cleared: true };
   }
 };
 
@@ -517,6 +681,9 @@ const ALL_TOOLS = {
     return { status: 'pong', timestamp: new Date().toISOString(), version: VERSION };
   }
 };
+
+// Admin tools require admin key
+const ADMIN_TOOL_NAMES = ['get_audit_log', 'get_rate_limits', 'clear_sessions'];
 
 const TOOL_SCHEMAS = [
   // Beeper
@@ -582,7 +749,12 @@ const TOOL_SCHEMAS = [
   { name: 'push_notify', description: 'Send push notification', inputSchema: { type: 'object', properties: { title: { type: 'string' }, text: { type: 'string' }, sound: { type: 'string' }, isTimeSensitive: { type: 'boolean' } }, required: ['title', 'text'] } },
   
   // System
-  { name: 'ping', description: 'Health check', inputSchema: { type: 'object', properties: {} } }
+  { name: 'ping', description: 'Health check', inputSchema: { type: 'object', properties: {} } },
+  
+  // Admin (requires admin key)
+  { name: 'get_audit_log', description: '[ADMIN] Get audit log', inputSchema: { type: 'object', properties: { limit: { type: 'number' } } } },
+  { name: 'get_rate_limits', description: '[ADMIN] Get rate limit status', inputSchema: { type: 'object', properties: {} } },
+  { name: 'clear_sessions', description: '[ADMIN] Clear all cached sessions', inputSchema: { type: 'object', properties: {} } }
 ];
 
 // ============ HTTP SERVER ============
@@ -590,11 +762,12 @@ const TOOL_SCHEMAS = [
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const path = url.pathname;
+  const clientIP = getClientIP(req);
 
   const cors = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-Key'
   };
 
   if (req.method === 'OPTIONS') {
@@ -602,15 +775,26 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
 
-  // Health check (no auth)
+  // Health check (no auth, no rate limit)
   if (path === '/health' || path === '/') {
     res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ status: 'healthy', version: VERSION, tools: TOOL_SCHEMAS.length }));
   }
 
-  // Auth check
-  const key = url.searchParams.get('key') || req.headers['x-api-key'];
-  if (key !== API_KEY) {
+  // Rate limit check
+  if (!checkRateLimit(clientIP)) {
+    logAudit('rate_limit_exceeded', { ip: clientIP });
+    res.writeHead(429, cors);
+    return res.end(JSON.stringify({ error: 'Rate limit exceeded. Try again later.' }));
+  }
+
+  // Auth check with timing-safe comparison
+  const providedKey = url.searchParams.get('key') || req.headers['x-api-key'];
+  const isValidKey = timingSafeEqual(providedKey, API_KEY);
+  const isAdminKey = ADMIN_KEY && timingSafeEqual(providedKey, ADMIN_KEY);
+  
+  if (!isValidKey && !isAdminKey) {
+    logAudit('auth_failed', { ip: clientIP, path });
     res.writeHead(401, cors);
     return res.end(JSON.stringify({ error: 'Unauthorized' }));
   }
@@ -626,7 +810,8 @@ const server = http.createServer(async (req, res) => {
     req.on('data', chunk => body += chunk);
     req.on('end', async () => {
       try {
-        const { method, params, id } = JSON.parse(body);
+        const parsed = JSON.parse(body);
+        const { method, params, id } = sanitizeInput(parsed);
         let result;
 
         if (method === 'initialize') {
@@ -636,12 +821,29 @@ const server = http.createServer(async (req, res) => {
             serverInfo: { name: 'garza-home-mcp', version: VERSION }
           };
         } else if (method === 'tools/list') {
-          result = { tools: TOOL_SCHEMAS };
+          // Filter admin tools if not using admin key
+          const tools = isAdminKey ? TOOL_SCHEMAS : TOOL_SCHEMAS.filter(t => !ADMIN_TOOL_NAMES.includes(t.name));
+          result = { tools };
         } else if (method === 'tools/call') {
-          const toolFn = ALL_TOOLS[params.name];
-          if (!toolFn) throw new Error(`Unknown tool: ${params.name}`);
-          const toolResult = await toolFn(params.arguments || {});
-          result = { content: [{ type: 'text', text: JSON.stringify(toolResult, null, 2) }] };
+          const toolName = params.name;
+          
+          // Check admin tool access
+          if (ADMIN_TOOL_NAMES.includes(toolName)) {
+            if (!isAdminKey) {
+              throw new Error(`Tool ${toolName} requires admin key`);
+            }
+            const toolFn = adminTools[toolName];
+            if (!toolFn) throw new Error(`Unknown admin tool: ${toolName}`);
+            const toolResult = await toolFn(sanitizeInput(params.arguments || {}));
+            result = { content: [{ type: 'text', text: JSON.stringify(toolResult, null, 2) }] };
+          } else {
+            const toolFn = ALL_TOOLS[toolName];
+            if (!toolFn) throw new Error(`Unknown tool: ${toolName}`);
+            
+            logAudit('tool_call', { ip: clientIP, tool: toolName });
+            const toolResult = await toolFn(sanitizeInput(params.arguments || {}));
+            result = { content: [{ type: 'text', text: JSON.stringify(toolResult, null, 2) }] };
+          }
         } else {
           throw new Error(`Unknown method: ${method}`);
         }
@@ -649,6 +851,7 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ jsonrpc: '2.0', id, result }));
       } catch (e) {
+        logAudit('tool_error', { ip: clientIP, error: e.message });
         res.writeHead(500, { ...cors, 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: e.message } }));
       }
@@ -661,6 +864,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Garza Home MCP v${VERSION} listening on port ${PORT}`);
-  console.log(`Tools: ${TOOL_SCHEMAS.length}`);
+  console.log(`Garza Home MCP v${VERSION} (SECURED) listening on port ${PORT}`);
+  console.log(`Tools: ${TOOL_SCHEMAS.length} (${ADMIN_TOOL_NAMES.length} admin)`);
+  console.log(`Rate limit: ${RATE_LIMIT_MAX} req/${RATE_LIMIT_WINDOW/1000}s`);
 });
