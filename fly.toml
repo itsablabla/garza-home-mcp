@@ -2,7 +2,7 @@ app = "garza-home-mcp"
 primary_region = "den"
 
 [build]
-  builder = "heroku/builder:22"
+  dockerfile = "Dockerfile"
 
 [env]
   NODE_ENV = "production"
